@@ -1,20 +1,48 @@
 import os
 import sys
-import logging
 import json
+import logging
 import requests
 from flask import Flask, request
 from telegram import Update
 import gspread
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info("🚀 Бот запускается...")
 
 TOKEN = os.environ.get('TOKEN')
+if not TOKEN:
+    logger.error("❌ TOKEN не задан")
+    sys.exit(1)
+
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 CATEGORIES = ['Закупка товара', 'Аренда', 'Зарплата', 'Реклама', 'Коммунальные', 'Транспорт', 'Налоги', 'Прочее']
+
+def get_creds():
+    """Возвращает учётные данные из переменной окружения или файла."""
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    if creds_json:
+        try:
+            creds_dict = json.loads(creds_json)
+            logger.info("✅ Учётные данные загружены из переменной окружения")
+            return Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        except Exception as e:
+            logger.error(f"Ошибка парсинга GOOGLE_CREDENTIALS: {e}")
+    # fallback на файл
+    if os.path.exists('credentials.json'):
+        try:
+            with open('credentials.json', 'r') as f:
+                creds_dict = json.load(f)
+            logger.info("✅ Учётные данные загружены из файла credentials.json")
+            return Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла credentials.json: {e}")
+    logger.error("❌ Не найдены учётные данные для Google Sheets")
+    return None
 
 def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -26,25 +54,28 @@ def send_message(chat_id, text):
         logger.error(f"Ошибка отправки: {e}")
 
 def add_expense(category, amount):
+    creds = get_creds()
+    if not creds:
+        return False, "Нет учётных данных для Google Sheets"
     try:
-        if not os.path.exists('credentials.json'):
-            logger.error("Файл credentials.json не найден")
-            return False, "Файл credentials.json не найден"
-        with open('credentials.json', 'r') as f:
-            creds_dict = json.load(f)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        # Принудительное обновление токена (решает проблему времени)
+        creds.refresh(Request())
         client = gspread.authorize(creds)
         logger.info("✅ Подключение к Google Sheets успешно")
+        
         sheet = client.open_by_key(SPREADSHEET_ID).sheet1
         logger.info(f"✅ Таблица открыта: {sheet.title}")
+        
         day = datetime.now().day
-        col = day + 1
+        col = day + 1  # колонка B для 1-го дня
         cats = sheet.col_values(1)
+        logger.info(f"📋 Категории в таблице: {cats}")
+        
         if category not in cats:
             return False, f"Категория '{category}' не найдена. Доступны: {', '.join(cats[1:])}"
         row = cats.index(category) + 1
         cell = sheet.cell(row, col)
-        current = float(cell.value) if cell.value and str(cell.value).replace('.','').isdigit() else 0
+        current = float(cell.value) if cell.value and str(cell.value).replace('.', '').isdigit() else 0
         new_value = current + amount
         sheet.update_cell(row, col, new_value)
         logger.info(f"✅ Ячейка {chr(64+col)}{row} обновлена на {new_value}")
