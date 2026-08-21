@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import json
 from flask import Flask, request
 from telegram import Bot, Update
 import gspread
@@ -12,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 logger.info("🚀 Бот запускается...")
 
-# ===== ТОКЕН =====
+# ===== ТОКЕН И КАТЕГОРИИ =====
 TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
     logger.error("❌ TOKEN не задан")
@@ -22,11 +23,11 @@ logger.info("✅ Токен получен")
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 CATEGORIES = ['Закупка товара', 'Аренда', 'Зарплата', 'Реклама', 'Коммунальные', 'Транспорт', 'Налоги', 'Прочее']
 
-# ===== GOOGLE SHEETS =====
+# ===== GOOGLE SHEETS (если есть файл) =====
 def add_expense(category, amount):
     try:
         if not os.path.exists('credentials.json'):
-            logger.error("Файл credentials.json не найден")
+            logger.warning("Файл credentials.json не найден, запись не выполняется")
             return False
         creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/spreadsheets'])
         client = gspread.authorize(creds)
@@ -53,14 +54,19 @@ bot = Bot(token=TOKEN)
 # ===== FLASK =====
 flask_app = Flask(__name__)
 
+# Главная страница для проверки
 @flask_app.route('/')
 def index():
     return "Bot is running!", 200
 
-@flask_app.route(f'/{TOKEN}', methods=['POST'])
+# Принимаем все POST-запросы (и от Telegram, и от Render health checks)
+@flask_app.route('/', methods=['POST'])
 def webhook():
     try:
         data = request.get_json(force=True)
+        if not data:
+            logger.warning("Пустой запрос")
+            return "ok", 200
         update = Update.de_json(data, bot)
         if update.message and update.message.text:
             chat_id = update.message.chat.id
@@ -83,24 +89,14 @@ def webhook():
             if add_expense(category, amount):
                 bot.send_message(chat_id=chat_id, text=f"✅ Записано {amount} в {category}")
             else:
-                bot.send_message(chat_id=chat_id, text="❌ Ошибка записи")
+                bot.send_message(chat_id=chat_id, text="❌ Ошибка записи (возможно, нет credentials.json или доступа)")
         return "ok", 200
     except Exception as e:
-        logger.error(f"Ошибка webhook: {e}")
+        logger.error(f"Ошибка: {e}")
         return "error", 500
 
 # ===== ЗАПУСК =====
 if __name__ == '__main__':
-    render_url = os.environ.get('RENDER_EXTERNAL_URL')
-    if render_url:
-        webhook_url = f"{render_url}/{TOKEN}"
-        try:
-            bot.set_webhook(url=webhook_url)
-            logger.info(f"✅ Webhook установлен: {webhook_url}")
-        except Exception as e:
-            logger.error(f"Ошибка webhook: {e}")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL не задан")
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Запуск на порту {port}")
     flask_app.run(host='0.0.0.0', port=port)
