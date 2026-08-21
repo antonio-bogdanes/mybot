@@ -19,7 +19,7 @@ REMIND_INTERVAL_MINUTES = 30
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info("🚀 Бот с кнопками и состояниями запускается...")
+logger.info("🚀 Бот с отчётами запускается...")
 
 TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
@@ -28,9 +28,7 @@ if not TOKEN:
 
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 
-# ===== ХРАНИЛИЩЕ СОСТОЯНИЙ =====
-user_data = {}  # {chat_id: {'category': str, 'waiting_for_amount': bool}}
-
+user_data = {}
 reminder_active = False
 reminder_thread = None
 reminding_in_progress = False
@@ -65,6 +63,39 @@ def get_categories_from_sheet(sheet):
         logger.error(f"Ошибка чтения категорий: {e}")
         return []
 
+def get_today_summary(sheet):
+    """Возвращает словарь {категория: сумма} для сегодняшнего дня и общий итог."""
+    try:
+        day = datetime.now().day
+        col = day + 1
+        # Берём весь столбец
+        col_values = sheet.col_values(col)
+        # Берём категории из первого столбца
+        categories = get_categories_from_sheet(sheet)
+        summary = {}
+        total = 0
+        # Предполагаем, что строки начинаются с 2 (первая — заголовок)
+        # и соответствуют порядку категорий
+        for i, cat in enumerate(categories):
+            # строка = i + 2 (т.к. категории начинаются со 2-й строки)
+            row_idx = i + 2
+            if row_idx < len(col_values):
+                val = col_values[row_idx - 1]  # т.к. col_values индексируется с 0
+            else:
+                val = 0
+            # Парсим число
+            try:
+                num = float(val) if val and str(val).replace('.', '').isdigit() else 0
+            except:
+                num = 0
+            if num != 0:
+                summary[cat] = num
+                total += num
+        return summary, total
+    except Exception as e:
+        logger.error(f"Ошибка получения итога: {e}")
+        return None, None
+
 def send_message(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
@@ -78,20 +109,10 @@ def send_message(chat_id, text, reply_markup=None):
         logger.error(f"Ошибка отправки: {e}")
 
 def has_today_expenses(sheet):
-    try:
-        day = datetime.now().day
-        col = day + 1
-        all_values = sheet.col_values(col)
-        if len(all_values) < 2:
-            return False
-        for val in all_values[1:]:
-            if val and str(val).replace('.', '').isdigit():
-                if float(val) > 0:
-                    return True
+    summary, total = get_today_summary(sheet)
+    if total is None:
         return False
-    except Exception as e:
-        logger.error(f"Ошибка проверки расходов: {e}")
-        return False
+    return total > 0
 
 def add_expense(category, amount):
     creds = get_creds()
@@ -127,7 +148,6 @@ def add_expense(category, amount):
         return False, f"Ошибка: {str(e)}"
 
 def get_category_keyboard():
-    """Создаёт клавиатуру с категориями."""
     creds = get_creds()
     if not creds:
         return None
@@ -212,19 +232,48 @@ def webhook():
                 keyboard = get_category_keyboard()
                 if keyboard:
                     send_message(chat_id, 
-                                 "👕 Бот с кнопками (двухшаговый).\n"
+                                 "👕 Бот с кнопками и отчётами.\n"
                                  "📌 **Как использовать:**\n"
                                  "1️⃣ Нажми на кнопку с категорией\n"
-                                 "2️⃣ Введи сумму (только число)\n\n"
-                                 f"⏰ Каждый день в {REMINDER_START_HOUR:02d}:{REMINDER_START_MINUTE:02d} я буду напоминать о расходах.",
+                                 "2️⃣ Введи сумму (только число)\n"
+                                 "Команды:\n"
+                                 "/today — отчёт за сегодня\n"
+                                 f"⏰ Напоминания с {REMINDER_START_HOUR:02d}:{REMINDER_START_MINUTE:02d}",
                                  reply_markup=keyboard.to_dict())
                 else:
-                    send_message(chat_id, "Не удалось загрузить категории. Проверь таблицу.")
+                    send_message(chat_id, "Не удалось загрузить категории.")
                 if not reminder_active:
                     reminder_active = True
                     reminding_in_progress = False
                     reminder_thread = threading.Thread(target=reminder_worker, args=(chat_id,), daemon=True)
                     reminder_thread.start()
+                return "ok", 200
+
+            if text.startswith('/today'):
+                # Отчёт за сегодня
+                creds = get_creds()
+                if not creds:
+                    send_message(chat_id, "Не могу подключиться к таблице.")
+                    return "ok", 200
+                try:
+                    creds.refresh(Request())
+                    client = gspread.authorize(creds)
+                    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+                    summary, total = get_today_summary(sheet)
+                    if summary is None or total is None:
+                        send_message(chat_id, "Ошибка при чтении данных.")
+                        return "ok", 200
+                    if total == 0:
+                        send_message(chat_id, "📊 За сегодня расходов нет.")
+                    else:
+                        # Формируем красивое сообщение
+                        lines = ["📊 **Итоги за сегодня:**"]
+                        for cat, amount in summary.items():
+                            lines.append(f"• {cat}: {amount:.2f}")
+                        lines.append(f"---\n**Общий итог:** {total:.2f}")
+                        send_message(chat_id, "\n".join(lines))
+                except Exception as e:
+                    send_message(chat_id, f"Ошибка: {e}")
                 return "ok", 200
 
             if text.startswith('/categories'):
@@ -235,8 +284,7 @@ def webhook():
                     send_message(chat_id, "Не удалось загрузить категории.")
                 return "ok", 200
 
-            # --- ОБРАБОТКА КАТЕГОРИИ (если нажата кнопка) ---
-            # Проверяем, есть ли такая категория в таблице (быстро)
+            # --- ОБРАБОТКА КАТЕГОРИИ ---
             creds = get_creds()
             if creds:
                 try:
@@ -245,19 +293,17 @@ def webhook():
                     sheet = client.open_by_key(SPREADSHEET_ID).sheet1
                     categories = get_categories_from_sheet(sheet)
                     if text in categories:
-                        # Это категория — сохраняем состояние
                         user_data[chat_id] = {'category': text, 'waiting_for_amount': True}
                         send_message(chat_id, f"💰 Категория «{text}» выбрана. Введи сумму (только число):")
                         return "ok", 200
                 except:
                     pass
 
-            # --- ОБРАБОТКА СУММЫ (если ожидаем) ---
+            # --- ОБРАБОТКА СУММЫ (ожидание) ---
             if chat_id in user_data and user_data[chat_id].get('waiting_for_amount'):
                 try:
                     amount = float(text.replace(',', '.'))
                     category = user_data[chat_id]['category']
-                    # Записываем расход
                     success, msg = add_expense(category, amount)
                     if success:
                         if reminding_in_progress:
@@ -265,19 +311,16 @@ def webhook():
                         send_message(chat_id, f"✅ {msg}")
                     else:
                         send_message(chat_id, f"❌ {msg}")
-                    # Очищаем состояние
                     del user_data[chat_id]
                     return "ok", 200
                 except ValueError:
                     send_message(chat_id, "❌ Нужно ввести число. Попробуй ещё раз:")
                     return "ok", 200
 
-            # --- Если ничего не подошло ---
-            # Проверяем формат "Категория Сумма" или "Сумма Категория" (для ручного ввода)
+            # --- РУЧНОЙ ВВОД (Категория Сумма или Сумма Категория) ---
             parts = text.split(maxsplit=1)
             if len(parts) == 2:
                 first, second = parts
-                # Пробуем "Категория Сумма"
                 try:
                     amount = float(second.replace(',', '.'))
                     category = first
@@ -291,7 +334,6 @@ def webhook():
                     return "ok", 200
                 except ValueError:
                     pass
-                # Пробуем "Сумма Категория"
                 try:
                     amount = float(first.replace(',', '.'))
                     category = second
@@ -306,11 +348,11 @@ def webhook():
                 except ValueError:
                     pass
 
-            # Если ничего не понятно
             send_message(chat_id, 
                          "❗ Не понял.\n"
                          "Используй кнопки для выбора категории, затем введи сумму.\n"
-                         "Или напиши в формате: `Категория Сумма` (например, `Транспорт 600`).")
+                         "Или напиши в формате: `Категория Сумма` (например, `Транспорт 600`).\n"
+                         "Команды: /today — отчёт за сегодня")
         return "ok", 200
     except Exception as e:
         logger.error(f"Ошибка: {e}")
