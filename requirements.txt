@@ -1,4 +1,5 @@
-Flask==3.0.0
-requests==2.31.0
+python-telegram-bot==20.7
 gspread==5.12.0
 google-auth==2.23.0
+Flask==3.0.0
+requests==2.31.0
