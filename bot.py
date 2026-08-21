@@ -6,21 +6,22 @@ import requests
 import threading
 import time
 from flask import Flask, request
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import CallbackContext  # для типов, но не обязательно
 import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
 from datetime import datetime, date
 
 # ===== НАСТРОЙКИ =====
-REMINDER_START_HOUR = 20      # Час начала (0-23)
-REMINDER_START_MINUTE = 0     # Минута
-REMIND_INTERVAL_MINUTES = 30  # Интервал между напоминаниями (минуты)
+REMINDER_START_HOUR = 20
+REMINDER_START_MINUTE = 0
+REMIND_INTERVAL_MINUTES = 30
 REMINDER_ENABLED = True
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.info("🚀 Бот с вечерним заёбыванием запускается...")
+logger.info("🚀 Бот с кнопками и заёбыванием запускается...")
 
 TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
@@ -29,12 +30,14 @@ if not TOKEN:
 
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 
-# ===== ПЕРЕМЕННЫЕ СОСТОЯНИЯ =====
+# ===== ПЕРЕМЕННЫЕ СОСТОЯНИЙ (временное хранилище) =====
+user_data = {}  # {chat_id: {'pending_amount': float, 'pending_category': None}}
+
 reminder_active = False
 reminder_thread = None
-last_remind_date = None        # дата, когда в последний раз было отправлено напоминание (используем для сброса на следующий день)
-reminding_in_progress = False   # идёт ли сейчас процесс заёбывания (после 20:00)
+reminding_in_progress = False
 
+# ===== ФУНКЦИИ РАБОТЫ С GOOGLE =====
 def get_creds():
     creds_json = os.environ.get('GOOGLE_CREDENTIALS')
     if creds_json:
@@ -64,17 +67,19 @@ def get_categories_from_sheet(sheet):
         logger.error(f"Ошибка чтения категорий: {e}")
         return []
 
-def send_message(chat_id, text):
+def send_message(chat_id, text, reply_markup=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=5)
+        resp = requests.post(url, json=payload, timeout=5)
         if resp.status_code != 200:
             logger.error(f"Ошибка отправки: {resp.text}")
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
 def has_today_expenses(sheet):
-    """Проверяет, есть ли расходы за сегодня (любая категория > 0)."""
     try:
         day = datetime.now().day
         col = day + 1
@@ -123,27 +128,44 @@ def add_expense(category, amount):
         logger.error(f"Ошибка записи: {e}")
         return False, f"Ошибка: {str(e)}"
 
-# ===== ФУНКЦИЯ ФОНОВОГО ПОТОКА (ЗАЁБЫВАНИЕ) =====
+def get_category_keyboard():
+    """Создаёт клавиатуру с категориями из таблицы."""
+    creds = get_creds()
+    if not creds:
+        return None
+    try:
+        creds.refresh(Request())
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+        categories = get_categories_from_sheet(sheet)
+        if not categories:
+            return None
+        # Разбиваем на столбцы (по 2 кнопки в ряд)
+        keyboard = []
+        row = []
+        for i, cat in enumerate(categories):
+            row.append(KeyboardButton(cat))
+            if (i + 1) % 2 == 0:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    except Exception as e:
+        logger.error(f"Ошибка создания клавиатуры: {e}")
+        return None
+
+# ===== ФУНКЦИЯ НАПОМИНАНИЙ =====
 def reminder_worker(chat_id):
-    global reminding_in_progress, last_remind_date
+    global reminding_in_progress
     logger.info("🧠 Поток напоминаний запущен")
     while reminder_active:
         now = datetime.now()
-        today = now.date()
-
-        # Если сегодня уже была запись расхода, то reminding_in_progress = False, и мы не спамим
-        # Но мы будем проверять это каждый цикл
-
-        # Если время ещё не наступило (до REMINDER_START_HOUR) – спим
         if now.hour < REMINDER_START_HOUR or (now.hour == REMINDER_START_HOUR and now.minute < REMINDER_START_MINUTE):
-            # До начала напоминаний ждём 10 минут
             time.sleep(600)
             continue
-
-        # Если время наступило, проверяем, были ли расходы сегодня
         creds = get_creds()
         if not creds:
-            logger.warning("Нет учётных данных, ждём...")
             time.sleep(600)
             continue
         try:
@@ -151,23 +173,22 @@ def reminder_worker(chat_id):
             client = gspread.authorize(creds)
             sheet = client.open_by_key(SPREADSHEET_ID).sheet1
             if has_today_expenses(sheet):
-                # Расходы есть – отключаем заёбывание до следующего дня
                 if reminding_in_progress:
-                    logger.info("✅ Расходы за сегодня уже есть, заёбывание отключено до завтра.")
+                    logger.info("✅ Расходы есть, заёбывание отключено.")
                     reminding_in_progress = False
-                # Ждём до полуночи (или до следующей проверки, но лучше спать дольше)
-                # будем проверять раз в час, не наступил ли новый день
                 time.sleep(3600)
                 continue
             else:
-                # Расходов нет – начинаем заёбывать, если ещё не начали
                 if not reminding_in_progress:
-                    logger.info("⏰ Начало заёбывания (расходов нет)")
+                    logger.info("⏰ Начало заёбывания")
                     reminding_in_progress = True
-                # Отправляем напоминание
-                send_message(chat_id, f"⚠️ **НАПОМИНАНИЕ!** Уже {now.strftime('%H:%M')}, а ты ещё не записал расходы.\nОтправь: сумма категория\nПример: 15000 Закупка товара")
+                # Отправляем напоминание с клавиатурой
+                keyboard = get_category_keyboard()
+                send_message(chat_id, 
+                             f"⚠️ **НАПОМИНАНИЕ!** Уже {now.strftime('%H:%M')}, а ты ещё не записал расходы.\n"
+                             f"Введи сумму (например, 15000), затем нажми категорию.",
+                             reply_markup=keyboard.to_dict() if keyboard else None)
                 logger.info("📩 Отправлено напоминание")
-                # Ждём интервал перед следующим напоминанием
                 time.sleep(REMIND_INTERVAL_MINUTES * 60)
         except Exception as e:
             logger.error(f"Ошибка в цикле напоминаний: {e}")
@@ -190,13 +211,21 @@ def webhook():
         update = Update.de_json(data, None)
         if update.message and update.message.text:
             chat_id = update.message.chat.id
-            text = update.message.text
+            text = update.message.text.strip()
             logger.info(f"Сообщение от {chat_id}: {text}")
 
+            # --- ОБРАБОТКА КОМАНД ---
             if text.startswith('/start'):
-                send_message(chat_id, "👕 Бот учёта расходов с вечерним заёбыванием.\n"
-                                      f"Отправь: сумма категория\nПример: 15000 Закупка товара\n"
-                                      f"Каждый день с {REMINDER_START_HOUR:02d}:{REMINDER_START_MINUTE:02d} я буду напоминать каждые {REMIND_INTERVAL_MINUTES} минут, пока не запишешь расходы.")
+                # Показываем клавиатуру с категориями
+                keyboard = get_category_keyboard()
+                if keyboard:
+                    send_message(chat_id, 
+                                 "👕 Бот учёта расходов с кнопками.\n"
+                                 f"Как использовать:\n1️⃣ Введи сумму (например, 15000)\n2️⃣ Нажми категорию из кнопок\n\n"
+                                 f"Каждый день с {REMINDER_START_HOUR:02d}:{REMINDER_START_MINUTE:02d} я буду напоминать каждые {REMIND_INTERVAL_MINUTES} минут, пока не запишешь расходы.",
+                                 reply_markup=keyboard.to_dict())
+                else:
+                    send_message(chat_id, "Не удалось загрузить категории. Проверь таблицу.")
                 if not reminder_active:
                     reminder_active = True
                     reminding_in_progress = False
@@ -206,42 +235,59 @@ def webhook():
                 return "ok", 200
 
             if text.startswith('/categories'):
-                creds = get_creds()
-                if not creds:
-                    send_message(chat_id, "Не могу подключиться к таблице.")
-                    return "ok", 200
-                try:
-                    creds.refresh(Request())
-                    client = gspread.authorize(creds)
-                    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-                    cats = get_categories_from_sheet(sheet)
-                    if cats:
-                        send_message(chat_id, f"📋 Категории в таблице:\n{', '.join(cats)}")
-                    else:
-                        send_message(chat_id, "В таблице нет категорий.")
-                except Exception as e:
-                    send_message(chat_id, f"Ошибка: {e}")
+                keyboard = get_category_keyboard()
+                if keyboard:
+                    send_message(chat_id, "📋 Кнопки с категориями обновлены.", reply_markup=keyboard.to_dict())
+                else:
+                    send_message(chat_id, "Не удалось загрузить категории.")
                 return "ok", 200
 
-            # Обработка расхода
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                send_message(chat_id, "Пиши: сумма категория")
-                return "ok", 200
-            amount_str, category = parts
+            # --- ОБРАБОТКА СООБЩЕНИЙ (сумма или категория) ---
+            # Проверяем, является ли текст числом (суммой)
             try:
-                amount = float(amount_str.replace(',', '.'))
-            except:
-                send_message(chat_id, "Сумма должна быть числом")
+                amount = float(text.replace(',', '.'))
+                # Это сумма — сохраняем в user_data
+                user_data[chat_id] = {'pending_amount': amount}
+                send_message(chat_id, f"💰 Сумма {amount} сохранена. Теперь выбери категорию из кнопок ниже.")
                 return "ok", 200
+            except ValueError:
+                # Не число — возможно, это категория
+                pass
 
-            success, msg = add_expense(category, amount)
-            send_message(chat_id, f"{'✅' if success else '❌'} {msg}")
-            if success:
-                # Расход записан — если мы сейчас в режиме заёбывания, отключаем его до завтра
-                if reminding_in_progress:
-                    reminding_in_progress = False
-                    logger.info("⏹️ Заёбывание остановлено (расход записан)")
+            # Проверяем, есть ли сохранённая сумма для этого чата
+            if chat_id in user_data and user_data[chat_id].get('pending_amount'):
+                amount = user_data[chat_id]['pending_amount']
+                category = text
+                # Проверяем, что категория есть в таблице (можно просто попробовать записать)
+                success, msg = add_expense(category, amount)
+                if success:
+                    # Удаляем сохранённую сумму
+                    del user_data[chat_id]
+                    send_message(chat_id, f"✅ {msg}")
+                    # Если мы в режиме заёбывания, отключаем
+                    if reminding_in_progress:
+                        reminding_in_progress = False
+                        logger.info("⏹️ Заёбывание остановлено (расход записан)")
+                else:
+                    send_message(chat_id, f"❌ {msg}\nПопробуй выбрать категорию из кнопок.")
+                return "ok", 200
+            else:
+                # Ни сумма, ни категория с ожиданием — возможно, пользователь вводит в старом формате "сумма категория"
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2:
+                    try:
+                        amount = float(parts[0].replace(',', '.'))
+                        category = parts[1]
+                        success, msg = add_expense(category, amount)
+                        send_message(chat_id, f"{'✅' if success else '❌'} {msg}")
+                        if success and reminding_in_progress:
+                            reminding_in_progress = False
+                            logger.info("⏹️ Заёбывание остановлено (расход записан)")
+                        return "ok", 200
+                    except:
+                        pass
+                # Если ничего не подошло — подсказываем
+                send_message(chat_id, "Не понял. Введи сумму (число) или используй формат: сумма категория")
         return "ok", 200
     except Exception as e:
         logger.error(f"Ошибка: {e}")
