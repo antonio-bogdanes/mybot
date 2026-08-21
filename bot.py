@@ -2,8 +2,8 @@ import os
 import sys
 import logging
 import json
+import requests
 from flask import Flask, request
-from telegram import Bot, Update
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -23,11 +23,11 @@ logger.info("✅ Токен получен")
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 CATEGORIES = ['Закупка товара', 'Аренда', 'Зарплата', 'Реклама', 'Коммунальные', 'Транспорт', 'Налоги', 'Прочее']
 
-# ===== GOOGLE SHEETS (если есть файл) =====
+# ===== GOOGLE SHEETS =====
 def add_expense(category, amount):
     try:
         if not os.path.exists('credentials.json'):
-            logger.warning("Файл credentials.json не найден, запись не выполняется")
+            logger.warning("Файл credentials.json не найден")
             return False
         creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/spreadsheets'])
         client = gspread.authorize(creds)
@@ -48,18 +48,26 @@ def add_expense(category, amount):
         logger.error(f"Ошибка записи: {e}")
         return False
 
-# ===== БОТ =====
-bot = Bot(token=TOKEN)
+# ===== ОТПРАВКА СООБЩЕНИЙ =====
+def send_message(chat_id, text):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        resp = requests.post(url, json=payload)
+        if resp.status_code == 200:
+            logger.info(f"Сообщение отправлено {chat_id}")
+        else:
+            logger.error(f"Ошибка отправки: {resp.text}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
 
 # ===== FLASK =====
 flask_app = Flask(__name__)
 
-# Главная страница для проверки
 @flask_app.route('/')
 def index():
     return "Bot is running!", 200
 
-# Принимаем все POST-запросы (и от Telegram, и от Render health checks)
 @flask_app.route('/', methods=['POST'])
 def webhook():
     try:
@@ -67,29 +75,35 @@ def webhook():
         if not data:
             logger.warning("Пустой запрос")
             return "ok", 200
-        update = Update.de_json(data, bot)
-        if update.message and update.message.text:
-            chat_id = update.message.chat.id
-            text = update.message.text
+
+        # Парсим update вручную
+        if 'message' in data:
+            msg = data['message']
+            chat_id = msg['chat']['id']
+            text = msg.get('text', '')
             logger.info(f"Сообщение от {chat_id}: {text}")
 
             if text.startswith('/start'):
-                bot.send_message(chat_id=chat_id, text="👕 Бот работает!\nОтправь: сумма категория\nПример: 15000 Закупка товара")
+                send_message(chat_id, "👕 Бот работает!\nОтправь: сумма категория\nПример: 15000 Закупка товара")
                 return "ok", 200
 
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                bot.send_message(chat_id=chat_id, text="Пиши: сумма категория")
+                send_message(chat_id, "Пиши: сумма категория")
                 return "ok", 200
             amount_str, category = parts
-            amount = float(amount_str.replace(',', '.'))
+            try:
+                amount = float(amount_str.replace(',', '.'))
+            except:
+                send_message(chat_id, "Сумма должна быть числом")
+                return "ok", 200
             if category not in CATEGORIES:
-                bot.send_message(chat_id=chat_id, text=f"Категории: {', '.join(CATEGORIES)}")
+                send_message(chat_id, f"Категории: {', '.join(CATEGORIES)}")
                 return "ok", 200
             if add_expense(category, amount):
-                bot.send_message(chat_id=chat_id, text=f"✅ Записано {amount} в {category}")
+                send_message(chat_id, f"✅ Записано {amount} в {category}")
             else:
-                bot.send_message(chat_id=chat_id, text="❌ Ошибка записи (возможно, нет credentials.json или доступа)")
+                send_message(chat_id, "❌ Ошибка записи (проверь credentials.json и доступ к таблице)")
         return "ok", 200
     except Exception as e:
         logger.error(f"Ошибка: {e}")
