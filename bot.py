@@ -4,11 +4,10 @@ import logging
 import requests
 from flask import Flask, request
 from telegram import Update
-import gspread
-from google.oauth2.service_account import Credentials
+# import gspread  # временно закомментируем
+# from google.oauth2.service_account import Credentials
 from datetime import datetime
 
-# ===== ЛОГИ =====
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.info("🚀 Бот запускается...")
@@ -23,11 +22,12 @@ SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 CATEGORIES = ['Закупка товара', 'Аренда', 'Зарплата', 'Реклама', 'Коммунальные', 'Транспорт', 'Налоги', 'Прочее']
 
 def send_message(chat_id, text):
-    """Отправка сообщения через Telegram API (синхронно)"""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
+    logger.info(f"Отправка сообщения в {chat_id}: {text[:50]}... URL: {url}")
     try:
         resp = requests.post(url, json=payload, timeout=5)
+        logger.info(f"Ответ: статус {resp.status_code}, тело: {resp.text[:200]}")
         if resp.status_code != 200:
             logger.error(f"Ошибка отправки: {resp.text}")
         return resp
@@ -36,28 +36,32 @@ def send_message(chat_id, text):
         return None
 
 def add_expense(category, amount):
-    try:
-        if not os.path.exists('credentials.json'):
-            logger.warning("Файл credentials.json не найден, запись не выполняется")
-            return False
-        creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/spreadsheets'])
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-        day = datetime.now().day
-        col = day + 1
-        cats = sheet.col_values(1)
-        if category not in cats:
-            logger.error(f"Категория {category} не найдена")
-            return False
-        row = cats.index(category) + 1
-        cell = sheet.cell(row, col)
-        current = float(cell.value) if cell.value else 0
-        sheet.update_cell(row, col, current + amount)
-        logger.info(f"Записано {amount} в {category}")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка записи: {e}")
-        return False
+    # Временно всегда возвращаем True для теста
+    logger.info(f"(ЗАГЛУШКА) Записано бы {amount} в {category}")
+    return True
+    # Оригинальный код закомментируем
+    # try:
+    #     if not os.path.exists('credentials.json'):
+    #         logger.warning("Файл credentials.json не найден, запись не выполняется")
+    #         return False
+    #     creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/spreadsheets'])
+    #     client = gspread.authorize(creds)
+    #     sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+    #     day = datetime.now().day
+    #     col = day + 1
+    #     cats = sheet.col_values(1)
+    #     if category not in cats:
+    #         logger.error(f"Категория {category} не найдена")
+    #         return False
+    #     row = cats.index(category) + 1
+    #     cell = sheet.cell(row, col)
+    #     current = float(cell.value) if cell.value else 0
+    #     sheet.update_cell(row, col, current + amount)
+    #     logger.info(f"Записано {amount} в {category}")
+    #     return True
+    # except Exception as e:
+    #     logger.error(f"Ошибка записи: {e}")
+    #     return False
 
 flask_app = Flask(__name__)
 
@@ -72,7 +76,7 @@ def webhook():
         if not data:
             logger.warning("Пустой запрос")
             return "ok", 200
-        update = Update.de_json(data, None)  # bot не нужен
+        update = Update.de_json(data, None)
         if update.message and update.message.text:
             chat_id = update.message.chat.id
             text = update.message.text
@@ -87,14 +91,18 @@ def webhook():
                 send_message(chat_id, "Пиши: сумма категория")
                 return "ok", 200
             amount_str, category = parts
-            amount = float(amount_str.replace(',', '.'))
+            try:
+                amount = float(amount_str.replace(',', '.'))
+            except ValueError:
+                send_message(chat_id, "Сумма должна быть числом")
+                return "ok", 200
             if category not in CATEGORIES:
                 send_message(chat_id, f"Категории: {', '.join(CATEGORIES)}")
                 return "ok", 200
             if add_expense(category, amount):
                 send_message(chat_id, f"✅ Записано {amount} в {category}")
             else:
-                send_message(chat_id, "❌ Ошибка записи (возможно, нет credentials.json или доступа)")
+                send_message(chat_id, "❌ Ошибка записи")
         return "ok", 200
     except Exception as e:
         logger.error(f"Ошибка: {e}")
