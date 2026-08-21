@@ -1,9 +1,9 @@
 import os
 import sys
 import logging
-import json
 import requests
 from flask import Flask, request
+from telegram import Update
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -13,7 +13,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 logger.info("🚀 Бот запускается...")
 
-# ===== ТОКЕН И КАТЕГОРИИ =====
 TOKEN = os.environ.get('TOKEN')
 if not TOKEN:
     logger.error("❌ TOKEN не задан")
@@ -23,11 +22,23 @@ logger.info("✅ Токен получен")
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 CATEGORIES = ['Закупка товара', 'Аренда', 'Зарплата', 'Реклама', 'Коммунальные', 'Транспорт', 'Налоги', 'Прочее']
 
-# ===== GOOGLE SHEETS =====
+def send_message(chat_id, text):
+    """Отправка сообщения через Telegram API (синхронно)"""
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        if resp.status_code != 200:
+            logger.error(f"Ошибка отправки: {resp.text}")
+        return resp
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return None
+
 def add_expense(category, amount):
     try:
         if not os.path.exists('credentials.json'):
-            logger.warning("Файл credentials.json не найден")
+            logger.warning("Файл credentials.json не найден, запись не выполняется")
             return False
         creds = Credentials.from_service_account_file('credentials.json', scopes=['https://www.googleapis.com/auth/spreadsheets'])
         client = gspread.authorize(creds)
@@ -48,20 +59,6 @@ def add_expense(category, amount):
         logger.error(f"Ошибка записи: {e}")
         return False
 
-# ===== ОТПРАВКА СООБЩЕНИЙ =====
-def send_message(chat_id, text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        resp = requests.post(url, json=payload)
-        if resp.status_code == 200:
-            logger.info(f"Сообщение отправлено {chat_id}")
-        else:
-            logger.error(f"Ошибка отправки: {resp.text}")
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
-
-# ===== FLASK =====
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -75,12 +72,10 @@ def webhook():
         if not data:
             logger.warning("Пустой запрос")
             return "ok", 200
-
-        # Парсим update вручную
-        if 'message' in data:
-            msg = data['message']
-            chat_id = msg['chat']['id']
-            text = msg.get('text', '')
+        update = Update.de_json(data, None)  # bot не нужен
+        if update.message and update.message.text:
+            chat_id = update.message.chat.id
+            text = update.message.text
             logger.info(f"Сообщение от {chat_id}: {text}")
 
             if text.startswith('/start'):
@@ -92,24 +87,19 @@ def webhook():
                 send_message(chat_id, "Пиши: сумма категория")
                 return "ok", 200
             amount_str, category = parts
-            try:
-                amount = float(amount_str.replace(',', '.'))
-            except:
-                send_message(chat_id, "Сумма должна быть числом")
-                return "ok", 200
+            amount = float(amount_str.replace(',', '.'))
             if category not in CATEGORIES:
                 send_message(chat_id, f"Категории: {', '.join(CATEGORIES)}")
                 return "ok", 200
             if add_expense(category, amount):
                 send_message(chat_id, f"✅ Записано {amount} в {category}")
             else:
-                send_message(chat_id, "❌ Ошибка записи (проверь credentials.json и доступ к таблице)")
+                send_message(chat_id, "❌ Ошибка записи (возможно, нет credentials.json или доступа)")
         return "ok", 200
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         return "error", 500
 
-# ===== ЗАПУСК =====
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Запуск на порту {port}")
